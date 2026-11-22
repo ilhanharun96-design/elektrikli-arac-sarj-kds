@@ -84,18 +84,63 @@ def load_data():
     for dosya in gerekli_dosyalar:
         if not dosya.exists():
             raise FileNotFoundError(
-                f"Gerekli dosya bulunamadı: {dosya}"
+                f"Gerekli CSV dosyası bulunamadı: {dosya.name}"
             )
 
-    train = pd.read_csv(
-        TRAIN_PATH,
-        parse_dates=["target_datetime", "origin_datetime"]
-    )
+    train_columns = {
+        "target_datetime",
+        "origin_datetime",
+        "forecast_horizon",
+        "target_weekday",
+        "target_hour",
+        "session_start_count",
+        "started_session_energy_kwh",
+        "session_start_count_rolling_mean_168",
+        ENERGY_LEVEL_COL,
+    }
 
-    validation = pd.read_csv(
-        VAL_PATH,
-        parse_dates=["target_datetime", "origin_datetime"]
-    )
+    validation_columns = train_columns.copy()
+    load_columns = {
+        "datetime",
+        "yuk_U100_kwh",
+        "yuk_F50_kwh",
+        "yuk_F25_kwh",
+    }
+
+    try:
+        train = pd.read_csv(
+            TRAIN_PATH,
+            parse_dates=["target_datetime", "origin_datetime"]
+        )
+    except (pd.errors.EmptyDataError, UnicodeDecodeError, OSError) as error:
+        raise ValueError(
+            f"'{TRAIN_PATH.name}' dosyası okunamadı: {error}"
+        )
+
+    try:
+        validation = pd.read_csv(
+            VAL_PATH,
+            parse_dates=["target_datetime", "origin_datetime"]
+        )
+    except (pd.errors.EmptyDataError, UnicodeDecodeError, OSError) as error:
+        raise ValueError(
+            f"'{VAL_PATH.name}' dosyası okunamadı: {error}"
+        )
+
+    eksik_train = sorted(train_columns - set(train.columns))
+    eksik_validation = sorted(validation_columns - set(validation.columns))
+
+    if eksik_train:
+        raise ValueError(
+            f"'{TRAIN_PATH.name}' dosyasında eksik sütunlar: "
+            + ", ".join(eksik_train)
+        )
+
+    if eksik_validation:
+        raise ValueError(
+            f"'{VAL_PATH.name}' dosyasında eksik sütunlar: "
+            + ", ".join(eksik_validation)
+        )
 
     tum = pd.concat(
         [train, validation],
@@ -126,10 +171,22 @@ def load_data():
         "started_session_energy_kwh"
     ].astype(float)
 
-    load = pd.read_csv(
-        LOAD_PATH,
-        parse_dates=["datetime"]
-    )
+    try:
+        load = pd.read_csv(
+            LOAD_PATH,
+            parse_dates=["datetime"]
+        )
+    except (pd.errors.EmptyDataError, UnicodeDecodeError, OSError) as error:
+        raise ValueError(
+            f"'{LOAD_PATH.name}' dosyası okunamadı: {error}"
+        )
+
+    eksik_load = sorted(load_columns - set(load.columns))
+    if eksik_load:
+        raise ValueError(
+            f"'{LOAD_PATH.name}' dosyasında eksik sütunlar: "
+            + ", ".join(eksik_load)
+        )
 
     load = load.set_index("datetime").sort_index()
     load = load[load.index < TEST_START]
@@ -141,6 +198,7 @@ def load_data():
 # 3. ORTAK B0 PROFİL TAHMİNİ
 # ============================================================
 
+@st.cache_data
 def b0_profile_prediction(training, evaluation, target):
 
     training_unique = training.drop_duplicates(
@@ -183,6 +241,7 @@ def b0_profile_prediction(training, evaluation, target):
 # 4. OTURUM VE BAŞLANGIÇ ENERJİSİ İÇİN B0 + S1
 # ============================================================
 
+@st.cache_data
 def forecast_target(tum, series, target, level_column):
 
     calibration_start = (
@@ -288,6 +347,7 @@ def forecast_target(tum, series, target, level_column):
 # 5. YAKLAŞIK SAATLİK YÜK İÇİN B0
 # ============================================================
 
+@st.cache_data
 def load_profile_prediction(
     evaluation,
     load_series,
@@ -347,6 +407,7 @@ def load_profile_prediction(
 # 6. YAKLAŞIK YÜK İÇİN S1 KALİBRASYONU
 # ============================================================
 
+@st.cache_data
 def forecast_load(tum, energy_series, load, scenario):
 
     load_column = LOAD_SCENARIOS[scenario]
@@ -475,6 +536,69 @@ def forecast_load(tum, energy_series, load, scenario):
 # 7. ORTAK GRAFİK VE SONUÇ TABLOSU
 # ============================================================
 
+def show_load_scenario_comparison(tum, energy_series, load):
+
+    st.markdown("#### U100, F50 ve F25 Senaryo Karşılaştırması")
+
+    comparison = go.Figure()
+    scenario_colors = {
+        "U100": "#1f77b4",
+        "F50": "#ff7f0e",
+        "F25": "#2ca02c",
+    }
+
+    for scenario in ["U100", "F50", "F25"]:
+        try:
+            scenario_result, _ = forecast_load(
+                tum,
+                energy_series,
+                load,
+                scenario,
+            )
+        except (ValueError, KeyError) as error:
+            st.error(
+                f"{scenario} senaryosu karşılaştırmaya eklenemedi: {error}"
+            )
+            continue
+
+        comparison.add_trace(
+            go.Scatter(
+                x=scenario_result["Zaman"],
+                y=scenario_result["B0_Tahmin"],
+                mode="lines+markers",
+                name=scenario,
+                line=dict(
+                    width=2,
+                    color=scenario_colors[scenario],
+                ),
+            )
+        )
+
+    comparison.update_layout(
+        title="24 Saatlik Yaklaşık Yük Senaryolarının B0 Karşılaştırması",
+        xaxis_title="Tarih ve Saat",
+        yaxis_title="Yaklaşık yük (kWh/saat)",
+        hovermode="x unified",
+        template="plotly_white",
+        height=420,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1,
+        ),
+    )
+
+    st.plotly_chart(comparison, width="stretch")
+
+    st.caption(
+        "Karşılaştırmadaki çizgiler senaryoların B0 tahminleridir. "
+        "Bu değerler ölçülmüş şebeke yükü değil, eşit güç dağılımı "
+        "varsayımına dayalı yaklaşık sonuçlardır."
+    )
+
+
 def show_forecast(
     result,
     unit,
@@ -486,6 +610,12 @@ def show_forecast(
 
     if total_unit is None:
         total_unit = unit
+
+    st.caption(
+        "B0 geçmiş gün-saat profilini son 168 saatlik seviye ile "
+        "ölçekleyen noktasal tahmindir. S1, kalibrasyon artıklarına "
+        "dayanan geçici üst belirsizlik sınırıdır."
+    )
 
     col1, col2, col3 = st.columns(3)
 
@@ -526,6 +656,8 @@ def show_forecast(
             mode="lines+markers",
             name="B0 Noktasal Tahmin",
             line=dict(width=2),
+            fill="tonexty",
+            fillcolor="rgba(31, 119, 180, 0.14)",
         )
     )
 
@@ -547,7 +679,7 @@ def show_forecast(
 
     st.plotly_chart(
         fig,
-        use_container_width=True
+        width="stretch"
     )
 
     tablo = result[
@@ -570,7 +702,7 @@ def show_forecast(
 
     st.dataframe(
         tablo.round(2),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -639,6 +771,58 @@ def show_forecast(
 # 8. 4. SEKME: MODEL PERFORMANSI VE KARŞILAŞTIRMA
 # ============================================================
 
+@st.cache_data
+def load_performance_csv(performance_path, test_path):
+    performance_required = {
+        "Yöntem",
+        "Sınıf",
+        "oturum_MAE",
+        "oturum_WAPE_pct",
+        "enerji_MAE",
+        "enerji_WAPE_pct",
+    }
+    test_required = {
+        "target",
+        "model",
+        "dataset",
+        "MAE",
+        "WAPE_percent",
+    }
+
+    if not performance_path.exists():
+        raise FileNotFoundError(
+            f"Performans dosyası bulunamadı: {performance_path.name}"
+        )
+    if not test_path.exists():
+        raise FileNotFoundError(
+            f"Test sonuç dosyası bulunamadı: {test_path.name}"
+        )
+
+    try:
+        performance_data = pd.read_csv(performance_path)
+        test_results = pd.read_csv(test_path)
+    except (pd.errors.EmptyDataError, UnicodeDecodeError, OSError) as error:
+        raise ValueError(f"Performans CSV dosyası okunamadı: {error}")
+
+    eksik_performance = sorted(
+        performance_required - set(performance_data.columns)
+    )
+    eksik_test = sorted(test_required - set(test_results.columns))
+
+    if eksik_performance:
+        raise ValueError(
+            f"{performance_path.name} dosyasında eksik sütunlar: "
+            + ", ".join(eksik_performance)
+        )
+    if eksik_test:
+        raise ValueError(
+            f"{test_path.name} dosyasında eksik sütunlar: "
+            + ", ".join(eksik_test)
+        )
+
+    return performance_data, test_results
+
+
 def show_performance_section():
 
     st.subheader("Model Performansı ve Yöntem Karşılaştırması")
@@ -650,11 +834,20 @@ def show_performance_section():
 
     performance_path = BASE_DIR / "outputs_modeling" / "rolling_origin_karsilastirma.csv"
     test_path = BASE_DIR / "outputs_modeling" / "model_karsilastirma_sonuclari.csv"
-    if not performance_path.exists() or not test_path.exists():
-        st.error("Performans sonuç dosyaları bulunamadı. Önce performans_ozeti_olustur.py çalıştırılmalıdır.")
+    try:
+        performance_data, test_results = load_performance_csv(
+            performance_path,
+            test_path,
+        )
+    except FileNotFoundError as error:
+        st.error(
+            f"{error}. Dosyayı yeniden oluşturmak için "
+            "performans_ozeti_olustur.py çalıştırılabilir."
+        )
         return
-
-    performance_data = pd.read_csv(performance_path)
+    except ValueError as error:
+        st.error(f"Performans sonuçları okunamadı: {error}")
+        return
     display = performance_data[[
         "Yöntem", "Sınıf", "oturum_MAE", "oturum_WAPE_pct", "enerji_MAE", "enerji_WAPE_pct"
     ]].rename(columns={
@@ -669,7 +862,7 @@ def show_performance_section():
         "Uygulama açıldığında model yeniden eğitilmez."
     )
     st.markdown("#### Rolling-origin doğrulama sonuçları")
-    st.dataframe(display.round(3), use_container_width=True, hide_index=True)
+    st.dataframe(display.round(3), width="stretch", hide_index=True)
     st.caption(
         "MAE ve WAPE üç aylık kıvrımın ortalamasıdır. R1 artık-öğrenen deneyi, "
         "eski sürümünde eğitim artıklarını aynı eğitim verisi üzerindeki B0 "
@@ -677,38 +870,53 @@ def show_performance_section():
     )
 
     session_chart = go.Figure(go.Bar(
-        x=performance_data["Yöntem"],
-        y=performance_data["oturum_MAE"],
+        y=performance_data["Yöntem"],
+        x=performance_data["oturum_MAE"],
         text=[f"{x:.3f}" for x in performance_data["oturum_MAE"]],
         textposition="outside",
+        orientation="h",
+        marker_color=[
+            "#1f77b4"
+            if method == "B0 Profil × Seviye"
+            else "#b0b5bd"
+            for method in performance_data["Yöntem"]
+        ],
     ))
     session_chart.update_layout(
         title="Oturum Başlangıç Sayısı MAE",
-        xaxis_title="Tahmin yöntemi",
-        yaxis_title="MAE (oturum)",
+        xaxis_title="MAE (oturum)",
+        yaxis_title="Tahmin yöntemi",
         template="plotly_white",
         height=430,
+        yaxis=dict(autorange="reversed"),
     )
-    st.plotly_chart(session_chart, use_container_width=True)
+    st.plotly_chart(session_chart, width="stretch")
 
     energy_chart = go.Figure(go.Bar(
-        x=performance_data["Yöntem"],
-        y=performance_data["enerji_MAE"],
+        y=performance_data["Yöntem"],
+        x=performance_data["enerji_MAE"],
         text=[f"{x:.2f}" for x in performance_data["enerji_MAE"]],
         textposition="outside",
+        orientation="h",
+        marker_color=[
+            "#1f77b4"
+            if method == "B0 Profil × Seviye"
+            else "#b0b5bd"
+            for method in performance_data["Yöntem"]
+        ],
     ))
     energy_chart.update_layout(
         title="Başlangıç Saatine Atfedilen Enerji MAE",
-        xaxis_title="Tahmin yöntemi",
-        yaxis_title="MAE (kWh)",
+        xaxis_title="MAE (kWh)",
+        yaxis_title="Tahmin yöntemi",
         template="plotly_white",
         height=430,
+        yaxis=dict(autorange="reversed"),
     )
-    st.plotly_chart(energy_chart, use_container_width=True)
+    st.plotly_chart(energy_chart, width="stretch")
 
     st.divider()
     st.markdown("#### İlk HGB referans modelinin Eylül 2022 değerlendirmesi")
-    test_results = pd.read_csv(test_path)
     test_results = test_results[
         (test_results["dataset"] == "test")
         & (test_results["model"] == "HistGradientBoosting")
@@ -755,6 +963,16 @@ def show_performance_section():
 def show_demand_profile(session_series, energy_series):
 
     st.subheader("Geçmiş Verilere Göre Talep Yoğunluğu")
+
+    veri_baslangici = min(session_series.index.min(), energy_series.index.min())
+    veri_bitisi = max(session_series.index.max(), energy_series.index.max())
+    veri_bitisi_dahil = veri_bitisi - pd.Timedelta(hours=1)
+
+    st.info(
+        f"Veri kapsamı: {veri_baslangici:%d.%m.%Y %H:%M}–"
+        f"{veri_bitisi_dahil:%d.%m.%Y %H:%M}. "
+        "Eylül 2022 gözlemleri yoğunluk analizine dahil edilmemiştir."
+    )
 
     st.write(
         """
@@ -858,7 +1076,7 @@ def show_demand_profile(session_series, energy_series):
 
     st.plotly_chart(
         fig_session_hour,
-        use_container_width=True
+        width="stretch"
     )
 
     fig_energy_hour = go.Figure()
@@ -881,7 +1099,7 @@ def show_demand_profile(session_series, energy_series):
 
     st.plotly_chart(
         fig_energy_hour,
-        use_container_width=True
+        width="stretch"
     )
 
     st.warning(
@@ -943,7 +1161,7 @@ def show_demand_profile(session_series, energy_series):
 
     st.plotly_chart(
         fig_session_heat,
-        use_container_width=True
+        width="stretch"
     )
 
     fig_energy_heat = go.Figure(
@@ -971,7 +1189,7 @@ def show_demand_profile(session_series, energy_series):
 
     st.plotly_chart(
         fig_energy_heat,
-        use_container_width=True
+        width="stretch"
     )
 
     # --------------------------------------------------------
@@ -1004,7 +1222,7 @@ def show_demand_profile(session_series, energy_series):
 
     st.dataframe(
         weekday_table.round(2),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -1058,10 +1276,22 @@ def main():
             ENERGY_LEVEL_COL,
         )
 
-    except Exception as error:
-        st.error(
-            f"Veri veya hedef tahmini yüklenemedi: {error}"
+    except FileNotFoundError as error:
+        st.error(f"CSV dosyası eksik: {error}")
+        st.info(
+            "Çalıştırılan kopyada `data/`, `outputs_cleaning/` veya "
+            "`archive/` klasörlerinin bulunması beklenmez. Ana uygulama "
+            "yukarıda adı verilen çıktı CSV'lerini kullanır."
         )
+        st.stop()
+    except ValueError as error:
+        st.error(f"CSV içeriği veya hedef sütunları doğrulanamadı: {error}")
+        st.stop()
+    except KeyError as error:
+        st.error(f"Tahmin verisinde beklenmeyen sütun eksikliği: {error}")
+        st.stop()
+    except Exception as error:
+        st.error(f"Tahmin hazırlanırken beklenmeyen hata oluştu: {error}")
         st.stop()
 
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
@@ -1132,22 +1362,6 @@ def main():
             "Varsayımsal Yaklaşık Saatlik Yük Tahmini"
         )
 
-        st.write(
-            """
-            Şarj oturumlarında tüketilen enerjinin zamana nasıl
-            dağıldığını incelemek için üç farklı varsayım
-            karşılaştırılmaktadır. Senaryo seçimi, tahmin edilen
-            yaklaşık saatlik yük profilini değiştirir.
-            """
-        )
-
-        st.warning(
-            "Veri sözlüğünde Duration, aracın şarj cihazına bağlı kaldığı süreyi "
-            "ifade eder; aktif enerji aktarım süresi veya ölçülmüş güç profili değildir. "
-            "Bu nedenle aşağıdaki dağıtımlar eşit güç varsayımına dayalı yaklaşık "
-            "senaryolardır; gerçek saatlik şebeke tüketimi olarak yorumlanmamalıdır."
-        )
-
         scenario = st.selectbox(
             "Yük dağılım senaryosu",
             options=["U100", "F50", "F25"],
@@ -1156,6 +1370,13 @@ def main():
                 "F50": "F50 – Enerji ilk %50 sürede verilir",
                 "F25": "F25 – Enerji ilk %25 sürede verilir",
             }[x],
+        )
+
+        st.warning(
+            "Veri sözlüğünde Duration, aracın şarj cihazına bağlı kaldığı süreyi "
+            "ifade eder; aktif enerji aktarım süresi veya ölçülmüş güç profili değildir. "
+            "Bu nedenle aşağıdaki dağıtımlar eşit güç varsayımına dayalı yaklaşık "
+            "senaryolardır; gerçek saatlik şebeke tüketimi olarak yorumlanmamalıdır."
         )
 
         scenario_descriptions = {
@@ -1199,10 +1420,28 @@ def main():
                 total_unit="kWh",
             )
 
+        except FileNotFoundError as error:
+            st.error(
+                f"Yük senaryosu için gerekli dosya bulunamadı: {error}"
+            )
+        except ValueError as error:
+            st.error(
+                f"Yük senaryosu verisi doğrulanamadı: {error}"
+            )
+        except KeyError as error:
+            st.error(
+                f"Yük senaryosu için beklenen sütun bulunamadı: {error}"
+            )
         except Exception as error:
             st.error(
                 f"Yaklaşık yük tahmini üretilemedi: {error}"
             )
+
+        show_load_scenario_comparison(
+            tum,
+            energy_series,
+            load,
+        )
 
         st.divider()
 
@@ -1249,56 +1488,38 @@ def main():
 
     with st.expander("📘 Veri, model ve metodoloji hakkında"):
 
-        st.markdown(
-            """
-            **B0 – Noktasal tahmin**
+        st.markdown("**1. B0 — Noktasal tahmin**")
+        st.write(
+            "Geçmiş hafta-gün-saat profilini son 168 saatlik seviye "
+            "ile ölçekler. Makine öğrenmesi modeli değildir."
+        )
 
-            Haftanın günü ve saate göre geçmiş ortalama profil,
-            son 168 saatlik seviye ile ölçeklendirilir. B0, makine
-            öğrenmesi modeli değil, istatistiksel profil-seviye
-            tahmin yaklaşımıdır.
+        st.markdown("**2. S1 — Belirsizlik üst sınırı**")
+        st.write(
+            "Son 8 haftalık kalibrasyon artıklarının q=0.90 kantili "
+            "ile hesaplanır. Kesin güvenlik veya kapasite garantisi değildir."
+        )
 
-            **S1 – Belirsizlik üst sınırı**
+        st.markdown("**3. Kalibrasyon ve veri ayrımı**")
+        st.write(
+            "Kalibrasyon satırları tahmin ufuklarıyla çoğalabilir; "
+            "aynı sayıda benzersiz saat anlamına gelmez. Eylül 2022 "
+            "gözlemleri uygulama tahmini ve yoğunluk profiline dahil edilmez."
+        )
 
-            Son 8 haftalık kalibrasyon dönemindeki standartlaştırılmış
-            tahmin artıkları kullanılarak q=0.90 üst sınırı hesaplanır.
-            Karekök ölçekleme yaklaşımı uygulanır. S1 kesin bir güvenlik
-            veya kapasite garantisi değildir.
+        st.markdown("**4. Yaklaşık yük varsayımları**")
+        st.write(
+            "Duration kaynakta bağlantı süresidir. U100/F50/F25, "
+            "enerjinin bağlantı süresince veya ilk %50/%25 bölümünde "
+            "eşit güçle dağıldığını varsayar. Ölçülmüş gerçek güç "
+            "profili değildir."
+        )
 
-            **Kalibrasyon satırları**
-
-            Kalibrasyon veri setinde aynı hedef saat farklı tahmin
-            başlangıçlarından ve tahmin ufuklarından gelebilir.
-            Bu nedenle kalibrasyon satır sayısı, benzersiz saat sayısıyla
-            aynı değildir. Artıklar ortak kalibrasyon havuzunda
-            değerlendirilir.
-
-            **Veri ayrımı**
-
-            Eylül 2022 test dönemi, bu uygulamadaki B0 profilinin ve
-            S1 kalibrasyon hesabının içine alınmaz. Talep yoğunluğu
-            analizi de Eylül öncesindeki saatlik gözlemlerle yapılır.
-
-            **Duration ve yaklaşık yük sınırlaması**
-
-            Kaynak veri sözlüğünde Duration, şarj cihazına bağlantı süresidir; aktif enerji
-            aktarım süresi değildir. U100/F50/F25 senaryoları Demand enerjisinin bu süre
-            boyunca veya ilk belirli kesrinde eşit güçle dağıtıldığı varsayımına dayanır.
-            Gerçek sayaç güç profili bulunmadığından bunlar fiziksel yük ölçümü değildir.
-
-            **Kapsam sınırı**
-
-            Tahminler veri setindeki ağ düzeyindeki gözlemleri temsil eder.
-            Her bir fiziksel istasyon veya trafo için ayrı tahmin değildir.
-            Projede gerçek trafo/şebeke kapasitesi ölçümü bulunmamaktadır.
-
-            **Karar destek amacı**
-
-            Sistem, operatörün saatlik talep eğilimlerini incelemesine
-            yardımcı olan tarihsel bir tahmin prototipidir. Otomatik
-            kapasite kontrolü, akıllı şarj optimizasyonu veya gerçek
-            zamanlı müdahale gerçekleştirmez.
-            """
+        st.markdown("**5. Kapsam sınırı**")
+        st.write(
+            "Bu prototip ağ düzeyindeki veri örüntülerini sunar; "
+            "istasyon, trafo veya araç bazlı kapasite kontrolü ve "
+            "gerçek zamanlı şebeke müdahalesi yapmaz."
         )
 
     st.caption(
